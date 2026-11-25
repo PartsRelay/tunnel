@@ -119,4 +119,12 @@ jobs:
           (cd dist && sha256sum partsrelay-tunnel-* > SHA256SUMS)
           gh release upload "$TAG" dist/partsrelay-tunnel-* dist/SHA256SUMS --clobber
           gh release upload "$TAG" dist/manifest.json.minisig dist/manifest.json --clobber
-          gh release edit "$TAG" --draft=false --latest
+          # Latest only when no published release is newer
+          newest="$(gh release list --exclude-drafts --exclude-pre-releases --limit 100 \
+            --json tagName --jq '.[].tagName' | sort -V | tail -n 1)"
+          if [ "$(printf '%s\n%s\n' "$newest" "$TAG" | sort -V | tail -n 1)" = "$TAG" ]; then
+            latest=true
+          else
+            latest=false
+          fi
+          gh release edit "$TAG" --draft=false --latest="$latest"
