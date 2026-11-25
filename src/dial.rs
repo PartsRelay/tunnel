@@ -24,6 +24,8 @@ use crate::{NAME, SUBPROTOCOL, TARGET, VERSION};
 
 /// Largest WebSocket message and frame accepted.
 pub const MAX_MESSAGE: usize = 1024 * 1024;
+/// Header of a handshake that must not replace a session.
+pub const PROBE_HEADER: &str = "partsrelay-tunnel-probe";
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(15 * 60);
 
 pub trait Io: AsyncRead + AsyncWrite + Send + Unpin {}
@@ -85,13 +87,23 @@ pub fn tls_config(cfg: &Config) -> Result<ClientConfig, DialError> {
         .with_no_client_auth())
 }
 
-async fn transport(cfg: &Config) -> Result<BoxIo, DialError> {
-    let server = &cfg.server;
-    let proxy = proxy::resolve(
+/// The proxy to reach the server through, if any.
+pub fn proxy_of(cfg: &Config) -> Option<proxy::ProxyUrl> {
+    // Plain ws:// is this computer: no proxy sees the token
+    if !cfg.server.tls {
+        return None;
+    }
+
+    proxy::resolve(
         cfg.proxy.as_ref(),
         |name| std::env::var(name).ok(),
-        &server.host,
-    );
+        &cfg.server.host,
+    )
+}
+
+async fn transport(cfg: &Config) -> Result<BoxIo, DialError> {
+    let server = &cfg.server;
+    let proxy = proxy_of(cfg);
     let tcp = match &proxy {
         Some(proxy) => {
             let mut tcp = TcpStream::connect((proxy.host.as_str(), proxy.port)).await?;
@@ -117,21 +129,33 @@ async fn transport(cfg: &Config) -> Result<BoxIo, DialError> {
 }
 
 fn rejected(status: StatusCode, retry_after: Option<&HeaderValue>) -> DialError {
-    let retry_after = retry_after
-        .and_then(|value| value.to_str().ok()?.trim().parse().ok())
-        .map(|seconds| Duration::from_secs(seconds).min(MAX_RETRY_AFTER));
+    let seconds = || -> Option<u64> { retry_after?.to_str().ok()?.trim().parse().ok() };
 
     match status.as_u16() {
         status @ (401 | 403) => DialError::Auth(status),
+        // Only "not now" says when to come back
+        status @ (429 | 503) => DialError::Rejected {
+            status,
+            retry_after: seconds().map(|seconds| Duration::from_secs(seconds).min(MAX_RETRY_AFTER)),
+        },
         status => DialError::Rejected {
             status,
-            retry_after,
+            retry_after: None,
         },
     }
 }
 
 /// Connects out to the server, through the proxy if any.
 pub async fn dial(cfg: &Config) -> Result<WebSocketStream<BoxIo>, DialError> {
+    open(cfg, false).await
+}
+
+/// Tests the token without replacing the live session.
+pub async fn probe(cfg: &Config) -> Result<WebSocketStream<BoxIo>, DialError> {
+    open(cfg, true).await
+}
+
+async fn open(cfg: &Config, probe: bool) -> Result<WebSocketStream<BoxIo>, DialError> {
     let handshake = |error: &dyn std::fmt::Display| DialError::Handshake(error.to_string());
     let mut request = cfg
         .server
@@ -150,6 +174,11 @@ pub async fn dial(cfg: &Config) -> Result<WebSocketStream<BoxIo>, DialError> {
         SEC_WEBSOCKET_PROTOCOL,
         HeaderValue::from_static(SUBPROTOCOL),
     );
+    if probe {
+        request
+            .headers_mut()
+            .insert(PROBE_HEADER, HeaderValue::from_static("1"));
+    }
 
     let limits = WebSocketConfig::default()
         .max_message_size(Some(MAX_MESSAGE))
@@ -177,4 +206,38 @@ pub async fn dial(cfg: &Config) -> Result<WebSocketStream<BoxIo>, DialError> {
     timeout(cfg.tuning.connect_timeout, connect)
         .await
         .map_err(|_| DialError::Timeout)?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wait_of(status: u16, retry_after: Option<&str>) -> Option<Duration> {
+        let header = retry_after.map(|value| HeaderValue::from_str(value).unwrap());
+
+        match rejected(StatusCode::from_u16(status).unwrap(), header.as_ref()) {
+            DialError::Rejected { retry_after, .. } => retry_after,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reads_retry_after_only_when_the_server_says_not_now() {
+        assert_eq!(wait_of(503, Some("30")), Some(Duration::from_secs(30)));
+        assert_eq!(wait_of(429, Some(" 7 ")), Some(Duration::from_secs(7)));
+        assert_eq!(wait_of(503, Some("86400")), Some(MAX_RETRY_AFTER));
+        assert_eq!(wait_of(503, Some("soon")), None);
+        assert_eq!(wait_of(503, None), None);
+        assert_eq!(wait_of(500, Some("30")), None);
+        assert_eq!(wait_of(404, Some("0")), None);
+    }
+
+    #[test]
+    fn tells_a_refused_token_from_the_other_refusals() {
+        let refused = rejected(StatusCode::UNAUTHORIZED, None);
+        let forbidden = rejected(StatusCode::FORBIDDEN, None);
+
+        assert!(matches!(refused, DialError::Auth(401)));
+        assert!(matches!(forbidden, DialError::Auth(403)));
+    }
 }

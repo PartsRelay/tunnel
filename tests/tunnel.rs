@@ -198,7 +198,7 @@ async fn keeps_trying_a_server_that_is_not_ready() {
 }
 
 #[tokio::test]
-async fn limits_the_streams_open_at_once() {
+async fn refuses_the_streams_beyond_its_limit_then_serves_again() {
     let (erp, _) = echo().await;
     let mut connectors = Connectors::start().await;
     let mut limited = config(&connectors.url(), &[erp.to_string()]);
@@ -206,27 +206,31 @@ async fn limits_the_streams_open_at_once() {
     let (stop, _tunnel) = start(limited);
     let mut session = connectors.tunnel().await;
 
-    let (_first, one) = session.open(&erp.to_string()).await;
+    let (mut first, one) = session.open(&erp.to_string()).await;
     let (_second, two) = session.open(&erp.to_string()).await;
+    let (_, third) = session.open(&erp.to_string()).await;
+
     assert!(one.ok && two.ok);
+    assert_eq!(third.error, Some(ErrorCode::TooManyStreams));
 
-    let mut third = session.control.open_stream().await.unwrap();
-    let request = partsrelay_tunnel::proto::OpenRequest {
-        target: erp.to_string(),
-    };
-    let _ = partsrelay_tunnel::proto::write_frame(&mut third, &request).await;
-    let answer = timeout(
-        Duration::from_secs(2),
-        partsrelay_tunnel::proto::read_frame::<_, partsrelay_tunnel::proto::OpenResponse>(
-            &mut third,
-        ),
-    )
-    .await;
-
-    assert!(
-        !matches!(answer, Ok(Ok(response)) if response.ok),
-        "a third stream was served"
+    // A stream that ends gives its place back
+    first.shutdown().await.unwrap();
+    assert_eq!(
+        timeout(WAIT, tokio::io::AsyncReadExt::read(&mut first, &mut [0; 8]))
+            .await
+            .expect("the end in time")
+            .unwrap(),
+        0
     );
+    let mut again = session.open(&erp.to_string()).await.1;
+    for _ in 0..100 {
+        if again.ok {
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+        again = session.open(&erp.to_string()).await.1;
+    }
+    assert!(again.ok, "{again:?}");
 
     stop.cancel();
 }
@@ -266,7 +270,7 @@ async fn drains_the_open_streams_then_stops() {
 }
 
 #[tokio::test]
-async fn connects_through_a_proxy_with_its_credentials() {
+async fn never_shows_a_plain_connection_to_the_proxy() {
     let (erp, _) = echo().await;
     let (proxy, requests) = connect_proxy().await;
     let mut connectors = Connectors::start().await;
@@ -277,16 +281,27 @@ async fn connects_through_a_proxy_with_its_credentials() {
 
     let (mut stream, response) = session.open(&erp.to_string()).await;
     assert!(response.ok);
-    stream.write_all(b"through").await.unwrap();
-    assert_eq!(read_all(&mut stream, 7).await, b"through");
+    stream.write_all(b"direct").await.unwrap();
+    assert_eq!(read_all(&mut stream, 6).await, b"direct");
+    assert!(requests.lock().unwrap().is_empty());
 
-    let request = requests.lock().unwrap().first().cloned().unwrap();
-    assert!(request.starts_with(&format!(
-        "CONNECT 127.0.0.1:{} HTTP/1.1",
-        connectors.address.port()
-    )));
-    assert!(request.contains("Proxy-Authorization: Basic bWFyaW86czNjcmV0\r\n"));
+    stop.cancel();
+}
 
+#[tokio::test]
+async fn dials_again_when_the_server_goes_silent() {
+    let mut connectors = Connectors::start().await;
+    let mut watchful = config(&connectors.url(), &[]);
+    watchful.tuning.keepalive = Duration::from_millis(100);
+    watchful.tuning.silence = Duration::from_millis(400);
+    let (stop, _tunnel) = start(watchful);
+
+    // Still connected, but nobody reads or answers any more
+    let frozen = connectors.tunnel().await.freeze();
+    connectors.tunnel().await;
+    assert!(connectors.attempts() >= 2);
+
+    drop(frozen);
     stop.cancel();
 }
 
@@ -302,11 +317,15 @@ mod tls {
     use tokio::time::timeout;
     use tokio_rustls::TlsAcceptor;
 
-    use super::common::{Connectors, config, echo, read_all, until};
+    use super::common::{Connectors, config, connect_proxy, echo, read_all, until};
     use super::start;
 
-    #[tokio::test]
-    async fn connects_over_tls_trusting_the_extra_certificate() {
+    /// A TLS server for localhost, and what trusts it.
+    fn localhost() -> (
+        rcgen::CertifiedKey<rcgen::KeyPair>,
+        TlsAcceptor,
+        tempfile::NamedTempFile,
+    ) {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let key =
@@ -318,8 +337,42 @@ mod tls {
         let mut ca_file = tempfile::NamedTempFile::new().unwrap();
         ca_file.write_all(issued.cert.pem().as_bytes()).unwrap();
 
+        (issued, TlsAcceptor::from(Arc::new(server)), ca_file)
+    }
+
+    #[tokio::test]
+    async fn connects_through_a_proxy_with_its_credentials() {
+        let (_, acceptor, ca_file) = localhost();
         let (erp, _) = echo().await;
-        let mut connectors = Connectors::start_tls(TlsAcceptor::from(Arc::new(server))).await;
+        let (proxy, requests) = connect_proxy().await;
+        let mut connectors = Connectors::start_tls(acceptor).await;
+        let mut proxied = config(&connectors.url(), &[erp.to_string()]);
+        proxied.ca_file = Some(ca_file.path().to_path_buf());
+        proxied.proxy = Some(format!("http://mario:s3cret@{proxy}").parse().unwrap());
+        let (stop, _tunnel) = start(proxied);
+        let mut session = connectors.tunnel().await;
+
+        let (mut stream, response) = session.open(&erp.to_string()).await;
+        assert!(response.ok);
+        stream.write_all(b"through").await.unwrap();
+        assert_eq!(read_all(&mut stream, 7).await, b"through");
+
+        let request = requests.lock().unwrap().first().cloned().unwrap();
+        assert!(request.starts_with(&format!(
+            "CONNECT localhost:{} HTTP/1.1",
+            connectors.address.port()
+        )));
+        assert!(request.contains("Proxy-Authorization: Basic bWFyaW86czNjcmV0\r\n"));
+
+        stop.cancel();
+    }
+
+    #[tokio::test]
+    async fn connects_over_tls_trusting_the_extra_certificate() {
+        let (issued, acceptor, ca_file) = localhost();
+
+        let (erp, _) = echo().await;
+        let mut connectors = Connectors::start_tls(acceptor).await;
         let mut trusting = config(&connectors.url(), &[erp.to_string()]);
         trusting.ca_file = Some(ca_file.path().to_path_buf());
         let (stop, _tunnel) = start(trusting);

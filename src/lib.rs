@@ -11,6 +11,7 @@ pub mod dial;
 pub mod logging;
 pub mod proto;
 pub mod proxy;
+pub mod reach;
 pub mod session;
 pub mod shutdown;
 pub mod update;
@@ -58,7 +59,8 @@ pub async fn run(cfg: Arc<Config>, shutdown: CancellationToken) -> anyhow::Resul
     stop.cancel();
     tunnel.await?;
 
-    Ok(if updated {
+    // Asked to stop: the new version starts next time
+    Ok(if updated && !shutdown.is_cancelled() {
         Exit::Restart
     } else {
         Exit::Shutdown

@@ -30,12 +30,12 @@ thiserror = "2.0.21"
 tokio = { version = "1.54", features = ["rt-multi-thread", "net", "io-util", "time", "macros", "signal", "sync"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
-tokio-util = "0.7.20"
-tokio-yamux = "0.3.20"
+tokio-util = { version = "0.7.20", features = ["compat"] }
 toml = { version = "1.2.3", default-features = false, features = ["std", "parse", "serde"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "fmt", "ansi", "json"] }
 ureq = { version = "3.5.2", default-features = false, features = ["rustls-no-provider", "platform-verifier"] }
+yamux = "0.14.1"
 
 [target.'cfg(unix)'.dependencies]
 tar = { version = "0.4.46", default-features = false }
@@ -46,6 +46,13 @@ zip = { version = "9.8.2", default-features = false, features = ["deflate-flate2
 [dev-dependencies]
 minisign = "0.10.0"
 rcgen = "0.14.10"
+tokio = { version = "1.54", features = ["test-util"] }
+# The fake server is another yamux implementation
+tokio-yamux = "0.3.20"
+
+# A test target whose buffers fill fast
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+socket2 = { version = "0.6.5", features = ["all"] }
 
 [lints.rust]
 unsafe_code = "forbid"

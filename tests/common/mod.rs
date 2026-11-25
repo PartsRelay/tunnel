@@ -2,7 +2,7 @@
 #![allow(dead_code, clippy::result_large_err)]
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -11,7 +11,7 @@ use partsrelay_tunnel::SUBPROTOCOL;
 use partsrelay_tunnel::config::Config;
 use partsrelay_tunnel::dial::BoxIo;
 use partsrelay_tunnel::proto::{OpenRequest, OpenResponse, read_frame, write_frame};
-use partsrelay_tunnel::wsio::WsIo;
+use partsrelay_tunnel::wsio::{Keepalive, WsIo};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -31,7 +31,11 @@ pub struct Tunnel {
     pub control: Control,
     pub headers: HeaderMap,
     driver: JoinHandle<()>,
+    frozen: Arc<AtomicBool>,
 }
+
+/// A tunnel whose connection is open but no longer read.
+pub struct Frozen(Tunnel);
 
 impl Tunnel {
     /// Opens a stream and sends its header.
@@ -67,6 +71,13 @@ impl Tunnel {
     /// Cuts the connection, as a server that crashes.
     pub fn cut(self) {
         self.driver.abort();
+    }
+
+    /// Keeps the connection open and stops serving it.
+    pub fn freeze(self) -> Frozen {
+        self.frozen.store(true, Ordering::SeqCst);
+
+        Frozen(self)
     }
 }
 
@@ -134,19 +145,29 @@ impl Connectors {
                     let Ok(ws) = accept_hdr_async(io, callback).await else {
                         return;
                     };
-                    let (io, _) = WsIo::new(ws);
+                    let (io, _) = WsIo::new(ws, Keepalive::default());
                     let mut session = Session::new_client(io, YamuxConfig::default());
                     let control = session.control();
-                    let driver =
-                        tokio::spawn(
-                            async move { while let Some(Ok(_)) = session.next().await {} },
-                        );
+                    let frozen = Arc::new(AtomicBool::new(false));
+                    let stuck = frozen.clone();
+                    let driver = tokio::spawn(async move {
+                        while !stuck.load(Ordering::SeqCst) {
+                            let step = timeout(Duration::from_millis(20), session.next());
+                            if matches!(step.await, Ok(None | Some(Err(_)))) {
+                                return;
+                            }
+                        }
+                        // Holds the socket, reads nothing
+                        std::future::pending::<()>().await;
+                        drop(session);
+                    });
                     let headers = seen.lock().unwrap().clone();
 
                     let _ = sender.send(Tunnel {
                         control,
                         headers,
                         driver,
+                        frozen,
                     });
                 });
             }

@@ -103,6 +103,8 @@ pub struct Tuning {
     pub replaced_wait: Duration,
     pub healthy_after: Duration,
     pub keepalive: Duration,
+    pub silence: Duration,
+    pub abandoned_after: Duration,
     pub drain: Duration,
 }
 
@@ -118,6 +120,8 @@ impl Default for Tuning {
             replaced_wait: Duration::from_secs(5 * 60),
             healthy_after: Duration::from_secs(60),
             keepalive: Duration::from_secs(20),
+            silence: Duration::from_secs(60),
+            abandoned_after: Duration::from_secs(60),
             drain: Duration::from_secs(30),
         }
     }
@@ -160,6 +164,40 @@ struct FileConfig {
     proxy: Option<String>,
     ca_file: Option<PathBuf>,
     max_streams: Option<usize>,
+}
+
+const SETTINGS: [&str; 7] = [
+    "server",
+    "token",
+    "allow",
+    "auto_update",
+    "proxy",
+    "ca_file",
+    "max_streams",
+];
+
+/// Where the file is wrong, never what the line holds.
+fn unreadable(text: &str, error: &toml::de::Error) -> ConfigError {
+    let Some(start) = error.span().map(|span| span.start.min(text.len())) else {
+        return ConfigError::Parse("it is not valid TOML".into());
+    };
+    let before = &text.as_bytes()[..start];
+    let number = before.iter().filter(|byte| **byte == b'\n').count() + 1;
+    let line = text.lines().nth(number - 1).unwrap_or_default();
+    // A secret may be anywhere on the line
+    let setting = line
+        .split_once('=')
+        .map(|(key, _)| key.trim())
+        .and_then(|key| SETTINGS.iter().find(|setting| **setting == key));
+
+    ConfigError::Parse(match setting {
+        Some(setting) => format!("line {number}: the value of {setting} is not valid"),
+        None if line.contains('=') => format!(
+            "line {number}: unknown setting, use one of {}",
+            SETTINGS.join(", ")
+        ),
+        None => format!("line {number} is not valid TOML"),
+    })
 }
 
 fn invalid(field: &'static str, reason: impl fmt::Display) -> ConfigError {
@@ -208,9 +246,7 @@ impl Config {
         env: impl Fn(&str) -> Option<String>,
     ) -> Result<Self, ConfigError> {
         let file: FileConfig = match file {
-            Some(text) => {
-                toml::from_str(text).map_err(|error| ConfigError::Parse(error.to_string()))?
-            }
+            Some(text) => toml::from_str(text).map_err(|error| unreadable(text, &error))?,
             None => FileConfig::default(),
         };
         let env = |name: &str| {
@@ -390,7 +426,7 @@ mod tests {
             Config::from_sources(None, none),
             Err(ConfigError::Token)
         ));
-        assert!(broken("token = 'a'\ntokn = 'b'").contains("tokn"));
+        assert!(broken("token = 'a'\ntokn = 'b'").contains("line 2: unknown setting"));
         assert!(broken("token = 'a b'").starts_with("token is not valid"));
         assert!(
             broken("token = 'a'\nallow = ['erp.local']").contains("erp.local: expected host:port")
@@ -398,6 +434,34 @@ mod tests {
         assert!(broken("token = 'a'\nallow = ['*:80']").starts_with("allow is not valid"));
         assert!(broken("token = 'a'\nmax_streams = 0").starts_with("max_streams is not valid"));
         assert!(broken("token = 'a'\nproxy = 'socks5://p:1'").starts_with("proxy is not valid"));
+    }
+
+    #[test]
+    fn never_repeats_a_line_it_cannot_read() {
+        let broken = |file: &str| {
+            Config::from_sources(Some(file), none)
+                .unwrap_err()
+                .to_string()
+        };
+        let files = [
+            "server = 'wss://a.example'\ntoken = \"prt_SECRET_live_123",
+            "token = prt_SECRET_live_123",
+            "tokn = \"prt_SECRET_live_123\"",
+            "token = 'a'\nproxy = \"http://mario:prt_SECRET@proxy.local:3128",
+            "token = 'a'\nmax_streams = \"prt_SECRET\"",
+            "token = 'a'\nauto_update = prt_SECRET",
+            "prt_SECRET_live_123",
+            "prt_SECRET== 'x'",
+        ];
+
+        for file in files {
+            let message = broken(file);
+
+            assert!(!message.contains("SECRET"), "{message}");
+            assert!(message.contains("line "), "{message}");
+        }
+        assert!(broken(files[1]).ends_with("line 1: the value of token is not valid"));
+        assert!(broken(files[3]).ends_with("line 2: the value of proxy is not valid"));
     }
 
     #[test]

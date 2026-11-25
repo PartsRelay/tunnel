@@ -22,6 +22,7 @@ pub enum ErrorCode {
     ConnectRefused,
     ConnectTimeout,
     ConnectFailed,
+    TooManyStreams,
     ShuttingDown,
 }
 

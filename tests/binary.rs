@@ -43,6 +43,30 @@ fn ends_with_code_2_on_a_broken_configuration() {
     assert!(logged.contains("erp.local: expected host:port"), "{logged}");
 }
 
+#[test]
+fn never_prints_a_secret_of_a_file_it_cannot_read() {
+    let file = config_file(
+        "token = \"prt_SECRET_live_123\nproxy = \"http://mario:hunter2@proxy.local:3128\n",
+    );
+    let output = Command::new(TUNNEL)
+        .arg("--config")
+        .arg(file.path())
+        .output()
+        .unwrap();
+    let printed = [output.stdout, output.stderr].concat();
+    let printed = String::from_utf8_lossy(&printed);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        printed.contains("line 1: the value of token is not valid"),
+        "{printed}"
+    );
+    assert!(
+        !printed.contains("SECRET") && !printed.contains("hunter2"),
+        "{printed}"
+    );
+}
+
 // SIGTERM is how systemd and launchd stop the tunnel
 #[cfg(unix)]
 mod process {

@@ -7,6 +7,7 @@ use tracing::{error, info, warn};
 
 use crate::config::Config;
 use crate::dial::{DialError, dial};
+use crate::proxy::ProxyError;
 use crate::session::{SessionEnd, serve};
 
 /// Close code: another tunnel took over with this token.
@@ -92,12 +93,17 @@ pub async fn run(cfg: Arc<Config>, stop: CancellationToken) {
                 error!(%error, "check the token of this tunnel");
                 refused.delay()
             }
+            Err(error @ DialError::Proxy(ProxyError::Credentials)) => {
+                error!(%error, "check the credentials of the proxy");
+                refused.delay()
+            }
             Err(DialError::Rejected {
                 status,
                 retry_after,
             }) => {
                 warn!(status, "the server is not accepting tunnels now");
-                retry_after.unwrap_or_else(|| backoff.delay())
+                // Never sooner than the backoff, whatever it asks
+                backoff.delay().max(retry_after.unwrap_or_default())
             }
             Err(error) => {
                 warn!(%error, "cannot connect");
