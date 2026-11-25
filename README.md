@@ -79,9 +79,9 @@ partsrelay-tunnel update --check
 partsrelay-tunnel --version
 ```
 
-`check` tells whether each target of the allow list answers and whether Parts Relay accepts the token. Run it first when something does not work.
+`check` tells whether each target of the allow list answers and whether Parts Relay accepts the token. Run it first when something does not work: it only probes, so the running tunnel keeps its connection.
 
-Logs go to standard error. `--log-level debug` shows every relayed connection, `--log-format json` writes one JSON object per line. The token and the proxy password are never logged.
+Logs go to standard error. `--log-level debug` shows every relayed connection, `--log-format json` writes one JSON object per line. The token and the proxy password are never logged: a configuration file that cannot be read is reported by its line number, never by its content.
 
 ### As a service
 
@@ -93,15 +93,17 @@ Logs go to standard error. `--log-level debug` shows every relayed connection, `
 | macOS   | `launchctl bootstrap system /Library/LaunchDaemons/com.partsrelay.tunnel.plist` | `/var/log/partsrelay-tunnel.log`              |
 | Windows | `Start-ScheduledTask -TaskName 'PartsRelay Tunnel'`                        | none by default, run it by hand to see them   |
 
-On Linux the service runs as the unprivileged user `partsrelay`, with a read only system. On Windows it runs as `LOCAL SERVICE`. On macOS it runs as root in this version.
+On Linux the service runs as the unprivileged user `partsrelay`, with a read only system and at most 256 MiB of memory. On Windows it runs as `LOCAL SERVICE`. On macOS it runs as root in this version.
+
+On Linux only root and that user read the configuration, and the user owns `/opt/partsrelay/bin`, where it replaces its own executable. So the executable is not linked into `/usr/local/bin`: run the other commands as the service does, like `sudo -u partsrelay /opt/partsrelay/bin/partsrelay-tunnel check`. With `--service`, `--prefix` takes only a directory the script creates for the tunnel.
 
 A broken configuration ends the tunnel with exit code 2 and systemd does not restart it. Any other end is restarted.
 
 ## Proxies and certificates
 
-- The tunnel uses the proxy of `proxy`, else of `HTTPS_PROXY`, else of `ALL_PROXY`, and honors `NO_PROXY` for the proxies found in the environment. A service usually has no such variables: set `proxy` in the file.
+- The tunnel uses the proxy of `proxy`, else of `HTTPS_PROXY`, else of `ALL_PROXY`, and honors `NO_PROXY` for the proxies found in the environment. A service usually has no such variables: set `proxy` in the file. A `ws://` server, which is always this computer, is never reached through a proxy.
 - Only `http://` proxies with no or Basic authentication are supported. NTLM, Kerberos, SOCKS and PAC files are not.
-- TLS is verified with the certificate store of the operating system, so the certificate authority of a TLS inspecting proxy works once it is installed there. `ca_file` adds certificates for the connection to Parts Relay only. There is no option to skip verification.
+- TLS is verified with the certificate store of the operating system, so the certificate authority of a TLS inspecting proxy works once it is installed there. `ca_file` adds certificates for the connection to Parts Relay only. There is no option to skip verification, and the updates never leave HTTPS.
 - Let these hosts through: the host of `server` on port 443, and for the updates `github.com` and `release-assets.githubusercontent.com` on port 443.
 
 ## Updates
@@ -117,7 +119,7 @@ A few seconds after it starts, and then about every 6 hours, the tunnel:
 
 On Linux and macOS it restarts by replacing its own process. On Windows it exits and the scheduled task starts the new version within a minute.
 
-If the directory of the executable is read only, the tunnel says so once and keeps running without updates. `auto_update = false` turns them off, and `partsrelay-tunnel update` installs one by hand.
+If the directory of the executable is read only, the tunnel says so once and keeps running without updates. `auto_update = false` turns them off, and `partsrelay-tunnel update` installs one by hand. A stop of the tunnel does not wait for a download in progress.
 
 ## Security model
 
@@ -128,7 +130,7 @@ What the tunnel protects, and what it does not.
 - **The network cannot read or change the traffic**, unless it is a TLS inspecting proxy whose certificate authority you installed: that proxy sees the token and the relayed bytes.
 - **A stolen release cannot be installed.** Whoever replaces the files of a release without the signing key fails the signature check. They can at most stop the updates.
 - **A local administrator owns the tunnel.** Whoever can read the configuration file has the token, and whoever can write the executable controls it. The install scripts restrict both to the service account and the administrators.
-- Limits that bound a misbehaving server: 64 connections at once by default, 4 KiB for the request of a connection, 10 seconds to send it and 10 seconds to connect, WebSocket messages up to 1 MiB.
+- Limits that bound a misbehaving server: 64 connections at once by default, 4 KiB for the request of a connection, 10 seconds to send it and 10 seconds to connect, WebSocket messages up to 1 MiB, and 32 MiB of relayed bytes waiting in memory, whatever window the server grants. A connection whose opener finished and stopped reading is dropped after 60 seconds, and a server that sends nothing for 60 seconds is dialed again.
 
 Report a vulnerability privately through the security advisories of this repository.
 
@@ -163,9 +165,9 @@ If a build fails, fix it and run the `Release` workflow by hand with the tag of 
    minisign -G -W -p minisign.pub -s minisign.key
    ```
 
-   Commit the new `minisign.pub`. Add the whole content of `minisign.key` as the secret `MINISIGN_SECRET_KEY`, in the `release` environment of the repository or among its secrets, then keep the file offline or delete it.
+   Commit the new `minisign.pub`. Add the whole content of `minisign.key` as the secret `MINISIGN_SECRET_KEY` of the `release` environment, then keep the file offline or delete it. Not among the secrets of the repository: a workflow run from any branch reads those.
 
-2. **Repository settings.** In Settings, Actions, General: allow GitHub Actions to create and approve pull requests. Merge with squash, with the pull request title as the commit message. Protect `main` and restrict the `release` environment to it.
+2. **Repository settings.** In Settings, Actions, General: allow GitHub Actions to create and approve pull requests. Merge with squash, with the pull request title as the commit message. Protect `main`, create the `release` environment and restrict it to `main`.
 
 3. **Optional, `RELEASE_PLEASE_TOKEN`.** Pull requests opened with the default token of Actions do not start other workflows, so the release pull request shows no checks. Its changes are only the version and the changelog. If you make the checks required, add a fine grained token or a GitHub App token as the secret `RELEASE_PLEASE_TOKEN`: the workflow uses it when present.
 
