@@ -1,0 +1,122 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag of a draft release left without files, like v0.3.1
+        required: true
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  # Opens the release pull request, or drafts its release
+  prepare:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    outputs:
+      release: ${{ steps.out.outputs.release }}
+      tag: ${{ steps.out.outputs.tag }}
+      version: ${{ steps.out.outputs.version }}
+    steps:
+      - id: rp
+        if: github.event_name == 'push'
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          # With your own token CI runs on that pull request
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      - id: out
+        env:
+          CREATED: ${{ steps.rp.outputs.release_created }}
+          RELEASED_TAG: ${{ steps.rp.outputs.tag_name }}
+          ASKED_TAG: ${{ inputs.tag }}
+        run: |
+          tag="${ASKED_TAG:-$RELEASED_TAG}"
+          if [ -z "$ASKED_TAG" ] && [ "$CREATED" != "true" ]; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "unexpected tag $tag" >&2
+            exit 1
+          fi
+          {
+            echo "release=true"
+            echo "tag=$tag"
+            echo "version=${tag#v}"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.release == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ needs.prepare.outputs.tag }}
+      upload: true
+
+  # Signs the manifest, uploads everything, then publishes the draft
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      - name: Write the manifest
+        run: scripts/make-manifest.sh "$VERSION" "$TAG" dist > dist/manifest.json
+
+      - name: Install minisign
+        run: sudo apt-get update && sudo apt-get install -y minisign
+
+      # Fails until minisign.pub is the public half of the secret
+      - name: Sign the manifest
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          if [ -z "$MINISIGN_SECRET_KEY" ]; then
+            echo "set the MINISIGN_SECRET_KEY secret, see the README" >&2
+            exit 1
+          fi
+          umask 077
+          key="$RUNNER_TEMP/minisign.key"
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key"
+          minisign -S -s "$key" -m dist/manifest.json -t "partsrelay-tunnel $TAG" < /dev/null
+          rm -f "$key"
+          minisign -V -p minisign.pub -m dist/manifest.json
+
+      - name: Upload and publish
+        run: |
+          (cd dist && sha256sum partsrelay-tunnel-* > SHA256SUMS)
+          gh release upload "$TAG" dist/partsrelay-tunnel-* dist/SHA256SUMS --clobber
+          gh release upload "$TAG" dist/manifest.json.minisig dist/manifest.json --clobber
+          gh release edit "$TAG" --draft=false --latest

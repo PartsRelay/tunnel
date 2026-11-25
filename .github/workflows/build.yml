@@ -1,0 +1,86 @@
+name: Build
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit or tag to build, the calling commit by default
+        type: string
+        default: ''
+      upload:
+        description: Keep the archives as artifacts, for a release
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-24.04 }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
+          - { target: aarch64-apple-darwin, os: macos-15 }
+          - { target: x86_64-apple-darwin, os: macos-15 }
+          - { target: x86_64-pc-windows-msvc, os: windows-2025 }
+          - { target: aarch64-pc-windows-msvc, os: windows-11-arm }
+    env:
+      TARGET: ${{ matrix.target }}
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+
+      # The version of rust-toolchain.toml
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add "$TARGET"
+
+      - name: Install the musl compiler
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked --target "$TARGET"
+
+      - name: Check the executable
+        shell: bash
+        run: |
+          binary="target/$TARGET/release/partsrelay-tunnel"
+          case "$TARGET" in
+            *windows*) binary="$binary.exe" ;;
+          esac
+          case "$TARGET" in
+            x86_64-apple-darwin) file "$binary" | grep -q x86_64 ;;
+            *) "$binary" --version | grep -F "($TARGET)" ;;
+          esac
+          case "$TARGET" in
+            *musl*) ! ldd "$binary" 2>/dev/null | grep -q '=>' ;;
+          esac
+
+      - name: Package
+        if: runner.os != 'Windows'
+        run: tar -czf "partsrelay-tunnel-$TARGET.tar.gz" -C "target/$TARGET/release" partsrelay-tunnel -C "$GITHUB_WORKSPACE" LICENSE README.md
+
+      - name: Package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path "target/$env:TARGET/release/partsrelay-tunnel.exe", LICENSE, README.md -DestinationPath "partsrelay-tunnel-$env:TARGET.zip"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: inputs.upload
+        with:
+          name: dist-${{ matrix.target }}
+          path: partsrelay-tunnel-${{ matrix.target }}.*
+          if-no-files-found: error
+          retention-days: 7
