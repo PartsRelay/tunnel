@@ -311,6 +311,40 @@ fn fails_without_touching_anything_when_the_release_is_unreachable() {
     assert!(unchanged(&install));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stops_watching_at_once_while_a_download_hangs() {
+    let install = installed();
+    // A release host that takes the request and never answers
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let (asked, taken) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            if asked.send(stream).is_err() {
+                return;
+            }
+        }
+    });
+    let watching = updater(&install.exe, base_url, Vec::new());
+    let stop = tokio_util::sync::CancellationToken::new();
+    let watch = tokio::spawn(partsrelay_tunnel::update::watch_from(
+        watching,
+        stop.clone(),
+        std::time::Duration::from_millis(10),
+    ));
+
+    let held = tokio::task::spawn_blocking(move || taken.recv().unwrap())
+        .await
+        .unwrap();
+    stop.cancel();
+    let updated = tokio::time::timeout(std::time::Duration::from_secs(2), watch).await;
+
+    assert!(matches!(updated, Ok(Ok(false))), "{updated:?}");
+    assert!(unchanged(&install));
+    // Lets the abandoned download end
+    drop(held);
+}
+
 fn has(tool: &str) -> bool {
     Command::new(tool).arg("-v").output().is_ok()
 }

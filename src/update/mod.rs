@@ -50,14 +50,19 @@ impl Updater {
             base_url: RELEASES_URL.into(),
             keys: manifest::public_keys(include_str!("../../minisign.pub"))
                 .map_err(|error| anyhow!("the built in public key is not valid: {error}"))?,
-            exe: std::env::current_exe().context("cannot find this executable")?,
+            // Not a link to it: the real file is replaced
+            exe: install::running_exe().context("cannot find this executable")?,
             proxy: proxy::resolve(cfg.proxy.as_ref(), env, RELEASES_HOST),
         })
     }
 
+    fn agent(&self) -> Result<ureq::Agent> {
+        fetch::agent(self.proxy.as_ref(), self.base_url.starts_with("https://"))
+    }
+
     /// The manifest of the latest release, if it is newer.
     pub fn check(&self) -> Result<Option<Manifest>> {
-        let agent = fetch::agent(self.proxy.as_ref())?;
+        let agent = self.agent()?;
         let url = format!("{}/latest/download/manifest.json", self.base_url);
         let manifest = fetch::get(&agent, &url, MAX_MANIFEST)?;
         let signature = fetch::get(&agent, &format!("{url}.minisig"), MAX_SIGNATURE)?;
@@ -73,7 +78,7 @@ impl Updater {
         let asset = manifest.assets.get(&self.target).with_context(|| {
             format!("release {} has no build for {}", manifest.tag, self.target)
         })?;
-        let agent = fetch::agent(self.proxy.as_ref())?;
+        let agent = self.agent()?;
         let url = format!("{}/download/{}/{}", self.base_url, manifest.tag, asset.name);
         let archive = fetch::get(&agent, &url, asset.size)?;
 
@@ -117,8 +122,14 @@ fn jitter(base: Duration, spread: Duration) -> Duration {
 
 /// Checks now and then. True once an update is installed.
 pub async fn watch(updater: Updater, stop: CancellationToken) -> bool {
+    let first = jitter(Duration::from_secs(5), Duration::from_secs(25));
+
+    watch_from(updater, stop, first).await
+}
+
+/// Like `watch`, with the first check after `wait`.
+pub async fn watch_from(updater: Updater, stop: CancellationToken, mut wait: Duration) -> bool {
     let updater = std::sync::Arc::new(updater);
-    let mut wait = jitter(Duration::from_secs(5), Duration::from_secs(25));
 
     loop {
         tokio::select! {
@@ -127,7 +138,12 @@ pub async fn watch(updater: Updater, stop: CancellationToken) -> bool {
         }
 
         let checking = updater.clone();
-        let outcome = tokio::task::spawn_blocking(move || checking.update()).await;
+        let check = tokio::task::spawn_blocking(move || checking.update());
+        // A shutdown does not wait for a slow download
+        let outcome = tokio::select! {
+            outcome = check => outcome,
+            _ = stop.cancelled() => return false,
+        };
 
         wait = match outcome {
             Ok(Ok(Some(version))) => {

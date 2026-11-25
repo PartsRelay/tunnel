@@ -2,6 +2,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 use partsrelay_tunnel::cli::{Cli, Command};
@@ -16,7 +17,7 @@ const RESTART_FAILED: u8 = 75;
 fn main() -> ExitCode {
     let cli = Cli::parse();
     // Before any update replaces the file
-    let exe = std::env::current_exe().ok();
+    let exe = partsrelay_tunnel::update::install::running_exe().ok();
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
 
     logging::init(cli.log_level, cli.log_format);
@@ -63,7 +64,8 @@ fn run(cfg: Arc<Config>, exe: Option<PathBuf>, args: &[OsString]) -> ExitCode {
         let shutdown = shutdown::on_signal();
         partsrelay_tunnel::run(cfg, shutdown).await
     });
-    drop(runtime);
+    // An update check still downloading is left behind
+    runtime.shutdown_timeout(Duration::from_secs(1));
 
     match outcome {
         Ok(Exit::Shutdown) => ExitCode::SUCCESS,

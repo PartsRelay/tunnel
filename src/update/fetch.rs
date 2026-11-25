@@ -8,7 +8,7 @@ use crate::dial::user_agent;
 use crate::proxy::ProxyUrl;
 
 /// An HTTP client that trusts what the operating system trusts.
-pub fn agent(proxy: Option<&ProxyUrl>) -> Result<Agent> {
+pub fn agent(proxy: Option<&ProxyUrl>, https_only: bool) -> Result<Agent> {
     let proxy = proxy
         .map(|proxy| {
             let mut builder = Proxy::builder(ProxyProtocol::Http)
@@ -32,6 +32,8 @@ pub fn agent(proxy: Option<&ProxyUrl>) -> Result<Agent> {
     Ok(Agent::config_builder()
         .tls_config(tls)
         .proxy(proxy)
+        // Also for the redirects of the release host
+        .https_only(https_only)
         .user_agent(user_agent())
         .timeout_connect(Some(Duration::from_secs(15)))
         .timeout_global(Some(Duration::from_secs(300)))

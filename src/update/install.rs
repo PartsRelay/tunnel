@@ -21,6 +21,13 @@ fn sibling(exe: &Path, suffix: &str) -> PathBuf {
     exe.with_file_name(name)
 }
 
+/// The running executable itself, not a link to it.
+pub fn running_exe() -> io::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+
+    Ok(fs::canonicalize(&exe).unwrap_or(exe))
+}
+
 /// Where the previous executable is kept after an update.
 pub fn previous(exe: &Path) -> PathBuf {
     sibling(exe, "old")
@@ -68,13 +75,30 @@ pub fn preflight(staged: &Path, version: &Version) -> Result<()> {
     Ok(())
 }
 
+/// Keeps `exe` as `old`: a link, else a copy.
+#[cfg(unix)]
+fn keep(
+    exe: &Path,
+    old: &Path,
+    link: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    // The kernel refuses links to files of another user
+    link(exe, old).or_else(|_| fs::copy(exe, old).map(drop))
+}
+
 /// Puts the staged executable in place, keeping the previous one.
 #[cfg(unix)]
 pub fn replace_exe(exe: &Path, staged: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, chown};
+
     let old = previous(exe);
 
     let _ = fs::remove_file(&old);
-    fs::hard_link(exe, &old)?;
+    keep(exe, &old, |exe, old| fs::hard_link(exe, old))?;
+    // Run as root, it stays the file of its owner
+    if let Ok(owner) = fs::metadata(exe) {
+        let _ = chown(staged, Some(owner.uid()), Some(owner.gid()));
+    }
     // Atomic: the path always holds an executable
     fs::rename(staged, exe).inspect_err(|_| {
         let _ = fs::remove_file(&old);
@@ -129,6 +153,19 @@ mod tests {
         assert_eq!(fs::read(&exe).unwrap(), b"new");
         assert_eq!(fs::read(previous(&exe)).unwrap(), b"old");
         assert!(!staged.exists());
+    }
+
+    #[test]
+    fn copies_the_previous_executable_when_it_cannot_be_linked() {
+        let directory = tempfile::tempdir().unwrap();
+        let exe = directory.path().join("partsrelay-tunnel");
+        let old = previous(&exe);
+        let refused = |_: &Path, _: &Path| Err(io::ErrorKind::PermissionDenied.into());
+
+        fs::write(&exe, b"old").unwrap();
+        keep(&exe, &old, refused).unwrap();
+
+        assert_eq!(fs::read(&old).unwrap(), b"old");
     }
 
     #[test]
