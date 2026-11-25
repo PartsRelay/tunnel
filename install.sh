@@ -15,7 +15,8 @@ usage() {
 Usage: install.sh [--service] [--prefix DIR] [--pubkey FILE]
 
   --service      also register the tunnel with systemd (Linux) or launchd (macOS)
-  --prefix DIR   install under DIR instead of /opt/partsrelay
+  --prefix DIR   install under DIR instead of /opt/partsrelay, a directory
+                 of the tunnel alone when used with --service
   --pubkey FILE  verify the release signature with this minisign.pub (needs minisign)
 USAGE
 }
@@ -67,6 +68,20 @@ for tool in curl tar; do
   command -v "$tool" >/dev/null 2>&1 || fail "$tool is required"
 done
 
+# Written when this script creates the prefix
+MARK="$PREFIX/.partsrelay-tunnel"
+
+if [ "$SERVICE" -eq 1 ]; then
+  [ "$(id -u)" -eq 0 ] || fail "--service needs root"
+  if [ "$os" = "Linux" ]; then
+    command -v systemctl >/dev/null 2>&1 || fail "--service needs systemd"
+    # Its bin directory goes to the account of the service
+    if [ "$PREFIX" != "$DEFAULT_PREFIX" ] && [ -e "$PREFIX" ] && [ ! -f "$MARK" ]; then
+      fail "$PREFIX is used by something else: --service needs a directory of the tunnel alone"
+    fi
+  fi
+fi
+
 if command -v sha256sum >/dev/null 2>&1; then
   sha256() { sha256sum "$1" | cut -d' ' -f1; }
 elif command -v shasum >/dev/null 2>&1; then
@@ -102,11 +117,21 @@ curl -fsSL "$RELEASES/download/$tag/$archive" -o "$work/$archive"
 [ "$(sha256 "$work/$archive")" = "$expected" ] || fail "$archive does not match its SHA-256"
 
 tar -xzf "$work/$archive" -C "$work" partsrelay-tunnel
+if [ ! -e "$PREFIX" ]; then
+  mkdir -p "$PREFIX"
+  : >"$MARK"
+fi
 mkdir -p "$PREFIX/bin"
 install -m 0755 "$work/partsrelay-tunnel" "$PREFIX/bin/partsrelay-tunnel"
 
-if [ "$PREFIX" = "$DEFAULT_PREFIX" ] && [ -d /usr/local/bin ] && [ -w /usr/local/bin ]; then
-  ln -sf "$PREFIX/bin/partsrelay-tunnel" /usr/local/bin/partsrelay-tunnel
+shortcut="/usr/local/bin/partsrelay-tunnel"
+if [ "$SERVICE" -eq 1 ] && [ "$os" = "Linux" ]; then
+  # Writable by the service: not in the PATH of root
+  if [ "$(readlink "$shortcut" 2>/dev/null)" = "$PREFIX/bin/partsrelay-tunnel" ]; then
+    rm -f "$shortcut"
+  fi
+elif [ "$PREFIX" = "$DEFAULT_PREFIX" ] && [ -d /usr/local/bin ] && [ -w /usr/local/bin ]; then
+  ln -sf "$PREFIX/bin/partsrelay-tunnel" "$shortcut"
 fi
 
 if [ ! -e "$CONFIG" ] && mkdir -p "$(dirname "$CONFIG")" 2>/dev/null; then
@@ -126,17 +151,16 @@ fi
 echo "Installed $("$PREFIX/bin/partsrelay-tunnel" --version) in $PREFIX/bin"
 
 [ "$SERVICE" -eq 1 ] || exit 0
-[ "$(id -u)" -eq 0 ] || fail "--service needs root"
 
 if [ "$os" = "Linux" ]; then
-  command -v systemctl >/dev/null 2>&1 || fail "--service needs systemd"
-
   if ! id partsrelay >/dev/null 2>&1; then
     useradd --system --no-create-home --shell /usr/sbin/nologin partsrelay
   fi
   # The tunnel replaces its own executable when it updates
-  chown -R partsrelay "$PREFIX"
+  chown -R partsrelay "$PREFIX/bin"
+  # Only root and the tunnel read the token
   chgrp partsrelay "$CONFIG"
+  chmod 0640 "$CONFIG"
 
   cat >/etc/systemd/system/partsrelay-tunnel.service <<UNIT
 [Unit]
@@ -156,7 +180,9 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=$PREFIX
+ReadWritePaths=$PREFIX/bin
+# Far above what the tunnel buffers
+MemoryMax=256M
 
 [Install]
 WantedBy=multi-user.target
@@ -165,6 +191,7 @@ UNIT
   systemctl daemon-reload
   systemctl enable partsrelay-tunnel >/dev/null
   echo "Service registered. Edit $CONFIG, then run: systemctl start partsrelay-tunnel"
+  echo "To test it: sudo -u partsrelay $PREFIX/bin/partsrelay-tunnel check"
 else
   plist="/Library/LaunchDaemons/com.partsrelay.tunnel.plist"
 

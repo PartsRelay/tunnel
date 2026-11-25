@@ -25,6 +25,16 @@ $exe = Join-Path $installDir 'partsrelay-tunnel.exe'
 $config = Join-Path $configDir 'tunnel.toml'
 $taskName = 'PartsRelay Tunnel'
 $account = 'NT AUTHORITY\LOCAL SERVICE'
+# Well known SIDs: their names change with the language
+$administrators = '*S-1-5-32-544'
+$system = '*S-1-5-18'
+$localService = '*S-1-5-19'
+
+function Set-Access([string]$Path, [string]$ServiceRights) {
+    icacls $Path /inheritance:r /grant:r "${administrators}:(OI)(CI)F" "${system}:(OI)(CI)F" `
+        "${localService}:(OI)(CI)$ServiceRights" | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Cannot set the permissions of $Path (icacls ended with $LASTEXITCODE)" }
+}
 
 New-Item -ItemType Directory -Force -Path $installDir, $configDir | Out-Null
 
@@ -57,6 +67,11 @@ else {
     }
 }
 
+# The tunnel replaces its own executable when it updates
+Set-Access $installDir 'M'
+# Only the tunnel and the administrators read the token
+Set-Access $configDir 'R'
+
 if (-not (Test-Path $config)) {
     @'
 # Parts Relay tunnel. Every setting is described in the README.
@@ -69,11 +84,6 @@ allow = []
 '@ | Set-Content -Encoding utf8 $config
     Write-Host "Created $config: set the token and the allow list"
 }
-
-# The tunnel replaces its own executable when it updates
-icacls $installDir /inheritance:r /grant:r 'Administrators:(OI)(CI)F' 'SYSTEM:(OI)(CI)F' "${account}:(OI)(CI)M" | Out-Null
-# Only the tunnel and the administrators read the token
-icacls $configDir /inheritance:r /grant:r 'Administrators:(OI)(CI)F' 'SYSTEM:(OI)(CI)F' "${account}:(OI)(CI)R" | Out-Null
 
 Write-Host "Installed $(& $exe --version) in $installDir"
 
