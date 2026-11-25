@@ -1,0 +1,65 @@
+[package]
+name = "partsrelay-tunnel"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Outbound proxy from a private network to Parts Relay"
+license = "MIT"
+repository = "https://github.com/PartsRelay/tunnel"
+publish = false
+
+[dependencies]
+anyhow = "1.0.105"
+bytes = "1.12"
+clap = { version = "4.6.10", features = ["derive", "env"] }
+data-encoding = "2.11.1"
+fastrand = "2.5.0"
+flate2 = "1.1.11"
+futures-util = { version = "0.3.34", default-features = false, features = ["std", "sink"] }
+httparse = "1.10.1"
+minisign-verify = "0.3.0"
+percent-encoding = "2.3.2"
+ring = "0.17.14"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-platform-verifier = "0.7.1"
+semver = { version = "1.0.28", features = ["serde"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tempfile = "3.27.0"
+thiserror = "2.0.21"
+tokio = { version = "1.54", features = ["rt-multi-thread", "net", "io-util", "time", "macros", "signal", "sync"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
+tokio-util = { version = "0.7.20", features = ["compat"] }
+toml = { version = "1.2.3", default-features = false, features = ["std", "parse", "serde"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "fmt", "ansi", "json"] }
+ureq = { version = "3.5.2", default-features = false, features = ["rustls-no-provider", "platform-verifier"] }
+yamux = "0.14.1"
+
+[target.'cfg(unix)'.dependencies]
+tar = { version = "0.4.46", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+zip = { version = "9.8.2", default-features = false, features = ["deflate-flate2"] }
+
+[dev-dependencies]
+minisign = "0.10.0"
+rcgen = "0.14.10"
+tokio = { version = "1.54", features = ["test-util"] }
+# The fake server is another yamux implementation
+tokio-yamux = "0.3.20"
+
+# A test target whose buffers fill fast
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+socket2 = { version = "0.6.5", features = ["all"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
